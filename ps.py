@@ -20,8 +20,8 @@ TARGET_FOLDER = 'INBOX.kpp_simferopol.INBOX'
 DB_NAME = 'cars.db'
 CHECK_INTERVAL = 15
 
+
 def init_db():
-    """Инициализация БД: создание таблиц и индексов"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     # Таблица данных
@@ -43,164 +43,190 @@ def init_db():
             raw_subject TEXT
         )
     ''')
-    # Таблица состояния для хранения последнего UID
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS state (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    ''')
-    # Индекс для быстрого поиска по msg_id
+    # Таблица состояния
+    cursor.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)')
+    # Индекс для производительности
     cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_msg_id ON events(msg_id)')
     conn.commit()
     return conn
 
-def get_state(cursor, key, default="0"):
-    cursor.execute("SELECT value FROM state WHERE key = ?", (key,))
-    row = cursor.fetchone()
-    return row[0] if row else default
 
-def set_state(cursor, key, value):
-    cursor.execute("INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)", (key, str(value)))
+def get_last_uid(cursor):
+    cursor.execute("SELECT value FROM state WHERE key = 'last_uid'")
+    row = cursor.fetchone()
+    return int(row[0]) if row else 0
+
+
+def set_last_uid(cursor, uid):
+    cursor.execute(
+        "INSERT OR REPLACE INTO state (key, value) VALUES ('last_uid', ?)",
+        (str(uid),)
+    )
+
 
 def extract_field(field_name, text):
-    """Универсальный экстрактор на регулярных выражениях"""
-    pattern = fr"{field_name}\s*:\s*(.+)"
-    match = re.search(pattern, text, re.IGNORECASE)
+    """Ищет значение до конца строки, игнорирует регистр."""
+    pattern = fr"(?i){field_name}\s*:\s*([^\n\r]+)"
+    match = re.search(pattern, text)
     return match.group(1).strip() if match else "---"
 
-def parse_mail_body(msg):
-    """Надежное извлечение текста из HTML или Plain частей"""
-    html_body = None
-    text_body = None
+
+def get_email_body(msg):
+    """Надёжный выбор между HTML и Plain Text, игнорируя вложения."""
+    html = None
+    plain = None
 
     for part in msg.walk():
         ctype = part.get_content_type()
+        cdisp = str(part.get("Content-Disposition") or "")
+        if "attachment" in cdisp.lower():
+            continue
+
         payload = part.get_payload(decode=True)
-        if not payload: continue
+        if payload is None:
+            continue
+
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            text = payload.decode(charset, "replace")
+        except Exception:
+            text = payload.decode("utf-8", "replace")
 
         if ctype == "text/html":
-            html_body = payload.decode('utf-8', 'replace')
+            html = text
         elif ctype == "text/plain":
-            text_body = payload.decode('utf-8', 'replace')
+            plain = text
 
-    content = html_body or text_body
-    if not content: return None
+    body = html or plain
+    if not body:
+        return ""
 
-    # Очистка от HTML-тегов, если это HTML
-    if html_body:
-        soup = BeautifulSoup(content, 'html.parser')
-        for br in soup.find_all("br"): br.replace_with("\n")
-        content = soup.get_text()
+    if html:
+        soup = BeautifulSoup(body, 'html.parser')
+        for br in soup.find_all("br"):
+            br.replace_with("\n")
+        return soup.get_text()
+    return body
 
-    lines = content.split('\n')
-    clean_text = "\n".join([l.strip() for l in lines if l.strip()])
 
-    data = {
-        'model': extract_field("Модель", clean_text),
-        'number': extract_field("номер", clean_text).upper().replace(" ", ""),
-        'vin': extract_field("VIN", clean_text),
-        'client': extract_field("Клиент", clean_text),
-        'document': extract_field("Документ", clean_text),
-        'repair_type': extract_field("Вид ремонта", clean_text),
-        'auth': extract_field("Разрешил", clean_text),
-        'reason': extract_field("Причина", clean_text)
-    }
-    
-    # Обработка даты и времени отдельно
-    date_line = extract_field("Дата", clean_text)
-    parts = date_line.split()
-    data['date'] = parts[0] if len(parts) >= 1 else "---"
-    data['time'] = parts[1] if len(parts) >= 2 else "--:--:--"
-    
-    return data
+def decode_mime_header(s):
+    """Компактное декодирование MIME-заголовков."""
+    parts = decode_header(s or "")
+    decoded = ""
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            decoded += part.decode(enc or 'utf-8', 'replace')
+        else:
+            decoded += str(part)
+    return decoded
+
 
 def process_emails():
     conn = init_db()
     cursor = conn.cursor()
-    
-    last_uid = int(get_state(cursor, 'last_uid', "0"))
+
+    current_last_uid = get_last_uid(cursor)
+    max_uid_processed = current_last_uid
     added_count = 0
+    mail = None
 
     try:
         mail = imaplib.IMAP4_SSL(IMAP_SERVER)
         mail.login(EMAIL_USER, EMAIL_PASS)
         mail.select(f'"{TARGET_FOLDER}"', readonly=True)
 
-        # Поиск только новых UID через сервер
-        search_query = f"UID {last_uid + 1}:*" if last_uid > 0 else "ALL"
+        # Поиск новых UID (сортировка обязательна)
+        search_query = f"UID {current_last_uid + 1}:*" if current_last_uid > 0 else "UID 1:*"
         status, data = mail.uid('search', None, search_query)
 
-        if status != "OK" or not data[0]:
-            mail.logout()
+        if status != "OK" or not data or not data[0]:
             return 0
 
-        uids = data[0].split()
-        # Исключаем текущий последний UID, если сервер вернул его в диапазоне
-        new_uids = [u for u in uids if int(u) > last_uid]
-        total = len(new_uids)
+        uids = sorted(
+            [int(u) for u in data[0].split() if int(u) > current_last_uid]
+        )
+        total = len(uids)
 
         if total == 0:
-            mail.logout()
             return 0
 
-        for idx, uid_bytes in enumerate(new_uids, 1):
-            uid_str = uid_bytes.decode()
-            status, msg_data = mail.uid('fetch', uid_str, '(RFC822)')
-            
-            if status != "OK": continue
+        for idx, uid in enumerate(uids, 1):
+            try:
+                status, msg_data = mail.uid('fetch', str(uid), '(RFC822)')
+                if status != "OK" or not msg_data or not msg_data[0]:
+                    continue
 
-            raw_email = msg_data[0][1]
-            msg = email.message_from_bytes(raw_email)
-            
-            # Декодирование темы
-            subject = ""
-            for part, enc in decode_header(msg.get("Subject", "")):
-                if isinstance(part, bytes):
-                    subject += part.decode(enc or 'utf-8', 'replace')
-                else:
-                    subject += str(part)
+                msg = email.message_from_bytes(msg_data[0][1])
+                subject = decode_mime_header(msg.get("Subject"))
+                body_text = get_email_body(msg)
 
-            move_type = "ЗАЕЗД" if "ЗАЕЗД" in subject.upper() else "ВЫЕЗД" if "ВЫЕЗД" in subject.upper() else "---"
-            
-            info = parse_mail_body(msg)
-            if info:
+                move_type = (
+                    "ЗАЕЗД" if "ЗАЕЗД" in subject.upper()
+                    else "ВЫЕЗД" if "ВЫЕЗД" in subject.upper()
+                    else "---"
+                )
+
+                # Парсинг полей
+                m = extract_field("Модель", body_text)
+                n = extract_field("номер", body_text).upper().replace(" ", "")
+                v = extract_field("VIN", body_text)
+                c = extract_field("Клиент", body_text)
+                d = extract_field("Документ", body_text)
+                r = extract_field("Вид ремонта", body_text)
+                a = extract_field("Разрешил", body_text)
+                p = extract_field("Причина", body_text)
+
+                dt_raw = extract_field("Дата", body_text).split()
+                date_val = dt_raw[0] if len(dt_raw) > 0 else "---"
+                time_val = dt_raw[1] if len(dt_raw) > 1 else "--:--:--"
+
                 cursor.execute('''
                     INSERT OR IGNORE INTO events (
-                        msg_id, type, model, number, vin, client, 
-                        document, repair_type, event_date, event_time, 
+                        msg_id, type, model, number, vin, client,
+                        document, repair_type, event_date, event_time,
                         authorized_by, reason, raw_subject
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    uid_str, move_type, info['model'], info['number'], 
-                    info['vin'], info['client'], info['document'], 
-                    info['repair_type'], info['date'], info['time'], 
-                    info['auth'], info['reason'], subject
+                    str(uid), move_type, m, n, v, c,
+                    d, r, date_val, time_val, a, p, subject
                 ))
-                
-                # Обновляем состояние после каждого успешно обработанного письма
-                set_state(cursor, 'last_uid', uid_str)
-                added_count += 1
-                
-                print(f" Обработка: [{idx}/{total}] UID {uid_str}...", end="\r")
 
-        conn.commit()
-        mail.logout()
+                # Если запись реально добавлена (не дубль)
+                if cursor.rowcount > 0:
+                    added_count += 1
+                    max_uid_processed = uid  # считаем обработанным только при успешной вставке
+
+                print(f" Обработка: [{idx}/{total}] UID {uid}...", end="\r")
+
+            except Exception as e:
+                print(f"\n[!] Ошибка на UID {uid}: {e}")
+                continue
+
+        # Финализация: один commit и одно обновление состояния
+        if max_uid_processed > current_last_uid:
+            set_last_uid(cursor, max_uid_processed)
+            conn.commit()
+
         if added_count > 0:
-            print(f"\n[OK] Добавлено записей: {added_count}")
+            print(f"\n[OK] Сессия завершена. Добавлено новых записей: {added_count}")
         return added_count
 
     except Exception as e:
-        print(f"\n[Error] Ошибка IMAP/DB: {e}")
+        print(f"\n[Критическая ошибка]: {e}")
         return 0
     finally:
+        try:
+            if mail is not None:
+                mail.logout()
+        except Exception:
+            pass
         conn.close()
 
+
 if __name__ == "__main__":
-    print(f"--- Мониторинг запущен ({TARGET_FOLDER}) ---")
+    print(f"--- Мониторинг активен: {TARGET_FOLDER} ---")
     while True:
         process_emails()
-        # Компактный таймер ожидания
         for i in range(CHECK_INTERVAL, 0, -1):
-            print(f" Следующая проверка через {i} сек...  ", end="\r")
+            print(f" Ожидание: {i} сек...   ", end="\r")
             time.sleep(1)
