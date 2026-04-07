@@ -135,7 +135,7 @@ def process_emails():
         mail.login(EMAIL_USER, EMAIL_PASS)
         mail.select(f'"{TARGET_FOLDER}"', readonly=True)
 
-        # Поиск новых UID (сортировка обязательна)
+        # Поиск новых UID
         search_query = f"UID {current_last_uid + 1}:*" if current_last_uid > 0 else "UID 1:*"
         status, data = mail.uid('search', None, search_query)
 
@@ -191,10 +191,12 @@ def process_emails():
                     d, r, date_val, time_val, a, p, subject
                 ))
 
-                # Если запись реально добавлена (не дубль)
+                # Если запись реально добавлена
                 if cursor.rowcount > 0:
                     added_count += 1
-                    max_uid_processed = uid  # считаем обработанным только при успешной вставке
+
+                # UID считается обработанным ВСЕГДА, если fetch прошёл успешно
+                max_uid_processed = uid
 
                 print(f" Обработка: [{idx}/{total}] UID {uid}...", end="\r")
 
@@ -202,7 +204,7 @@ def process_emails():
                 print(f"\n[!] Ошибка на UID {uid}: {e}")
                 continue
 
-        # Финализация: один commit и одно обновление состояния
+        # Финализация
         if max_uid_processed > current_last_uid:
             set_last_uid(cursor, max_uid_processed)
             conn.commit()
