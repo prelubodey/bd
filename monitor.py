@@ -11,17 +11,16 @@ def get_rows():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    # Берём последние 14 записей по id
-    cursor.execute(f"""
+    cursor.execute("""
         SELECT type, model, number, event_time
         FROM events
+        WHERE event_date = ?
         ORDER BY id DESC
-        LIMIT {MAX_ROWS}
-    """)
+        LIMIT ?
+    """, (datetime.now().strftime("%d.%m.%Y"), MAX_ROWS))
+    
     rows = cursor.fetchall()
     conn.close()
-
-    # Разворачиваем, чтобы старые сверху, новые снизу
     return list(reversed(rows))
 
 def format_row(index, move_type, model, number, event_time):
@@ -50,8 +49,11 @@ def main():
     print(f"Монитор запущен. Вывод по {MAX_ROWS} строк в {OUTPUT_FILE}")
 
     while True:
-        rows = get_rows()
-        write_file(rows)
+        try:
+            rows = get_rows()
+            write_file(rows)
+        except Exception as e:
+            print(f"Ошибка: {e}")
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
